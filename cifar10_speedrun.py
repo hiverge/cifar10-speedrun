@@ -360,25 +360,6 @@ class CifarNet(nn.Module):
             mod.half()
         self.to(memory_format=torch.channels_last)
 
-    def init_whiten(self, train_images, eps=0.0005):
-        c, (h, w) = (train_images.shape[1], self.whiten.weight.shape[2:])
-        patches = (
-            train_images.unfold(2, h, 1)
-            .unfold(3, w, 1)
-            .transpose(1, 3)
-            .reshape(-1, c, h, w)
-            .float()
-        )
-        patches_flat = patches.view(len(patches), -1)
-        est_patch_covariance = patches_flat.T @ patches_flat / len(patches_flat)
-        eigenvalues, eigenvectors = torch.linalg.eigh(est_patch_covariance, UPLO="U")
-        eigenvectors_scaled = eigenvectors.T.reshape(-1, c, h, w) / torch.sqrt(
-            eigenvalues.view(-1, 1, 1, 1) + eps
-        )
-        self.whiten.weight.data[:] = torch.cat(
-            (eigenvectors_scaled, -eigenvectors_scaled)
-        )
-
     def forward(self, x, whiten_bias_grad=True):
         x = x.to(memory_format=torch.channels_last)
         b = self.whiten.bias
