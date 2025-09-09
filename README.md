@@ -1,4 +1,4 @@
-# cifar10-speedrun
+# CIFAR10-Speedrun
 
 This repository contains a script that trains a neural network to **94% accuracy on CIFAR-10 in just 2.095 seconds** on a single NVIDIA A100 GPU. This new record beats the previous best of 2.59 seconds.
 
