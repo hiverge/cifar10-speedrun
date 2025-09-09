@@ -8,8 +8,6 @@ This repository contains a script that trains a neural network to **94% accuracy
 | `airbench94_muon.py` | 94.01% | 2.59s |
 | Standard ResNet-18 training | 96.0% | 7min |
 
-\<br\>
-
 ## 🚀 Quickstart
 
 To run the speedrun, simply clone the repository and run the Python script.
@@ -22,5 +20,3 @@ python cifar10_speedrun.py
 ```
 
 This will download the CIFAR-10 dataset and run the training. The script requires `torch` and `torchvision`.
-
-\<br\>
