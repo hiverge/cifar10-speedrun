@@ -1,10 +1,4 @@
-import contextlib
 import os
-import sys
-
-with open(sys.argv[0]) as f:
-    code = f.read()
-import uuid
 from math import ceil
 import torch
 from torch import nn
@@ -248,7 +242,7 @@ class CifarLoader:
             torch.save(
                 {"images": images, "labels": labels, "classes": dset.classes}, data_path
             )
-        data = torch.load(data_path, map_location=torch.device("cuda"))
+        data = torch.load(data_path, map_location=torch.device("cuda"), weights_only=True)
         self.images, self.labels, self.classes = (
             data["images"],
             data["labels"],
@@ -498,8 +492,6 @@ def infer(model, loader, tta_level=0):
             confidences, _ = probs.max(dim=1)
             UNCERTAIN_QUANTILE = 0.2
             k_uncertain = int(n * UNCERTAIN_QUANTILE)
-            if k_uncertain == 0:
-                return initial_logits
             _, uncertain_indices = torch.topk(
                 confidences, k_uncertain, largest=False, sorted=False
             )
@@ -525,9 +517,8 @@ def infer(model, loader, tta_level=0):
                 )
                 tta_logits_parts.append(combined_tta_logits_batch)
 
-            if tta_logits_parts:
-                all_tta_logits_for_uncertain = torch.cat(tta_logits_parts, dim=0)
-                final_logits[uncertain_indices] = all_tta_logits_for_uncertain
+            all_tta_logits_for_uncertain = torch.cat(tta_logits_parts, dim=0)
+            final_logits[uncertain_indices] = all_tta_logits_for_uncertain
             return final_logits
 
     test_images = loader.normalize(loader.images)
@@ -637,7 +628,7 @@ def main(run, model):
         loss.backward()
         return loss
 
-    for epoch_idx in range(ceil(total_train_steps / len(train_loader))):
+    for epoch in range(ceil(total_train_steps / len(train_loader))):
         model.train()
         for inputs, labels in train_loader:
             train_step(inputs, labels, step, whiten_bias_train_steps, total_train_steps)
@@ -675,6 +666,8 @@ def main(run, model):
 
     tta_val_acc = evaluate(model, test_loader, tta_level=2)
     stop_timer()
+    epoch = "eval"
+    train_acc = evaluate(model, train_loader, tta_level=0)
     val_acc = evaluate(model, test_loader, tta_level=0)
     print_training_details(locals(), is_final_entry=True)
     return (val_acc, tta_val_acc, time_seconds)
@@ -689,18 +682,16 @@ if __name__ == "__main__":
     for run in range(200):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        torch.cuda._sleep(int(5000000000))
-        val_acc, tta_val_acc, time_seconds = main(run, model)
-        tta_target_gap_reduction = (tta_val_acc - val_acc) / (0.941 - val_acc) * 100.0
-        results.append((tta_target_gap_reduction, tta_val_acc, time_seconds))
+        torch.cuda._sleep(int(6000000000))
+        val_acc, tta_val_acc, time_seconds = main(run + 1, model)
+        results.append((val_acc, tta_val_acc, time_seconds))
         accs_so_far = [a for _, a, _ in results]
         times_so_far = [t for _, _, t in results]
         print(
-            f"Mean accuracy after {run + 1} runs: {sum(accs_so_far) / len(accs_so_far):.6f} | Mean time: {sum(times_so_far) / len(times_so_far):.6f}s"
+            f"Mean accuracy after {run + 1} runs: {sum(accs_so_far) / len(accs_so_far):.6f} | Mean time: {sum(times_so_far) / len(times_so_far):.6f}s", end='\r', flush=True
         )
-    tta_improvements, accs, times = zip(*results)
+    _, accs, times = zip(*results)
     accs = torch.tensor(accs)
     times = torch.tensor(times)
-    tta_improvements = torch.tensor(tta_improvements)
     print("Accuracies: Mean: %.6f    Std: %.6f" % (accs.mean(), accs.std()))
     print("Times (s):  Mean: %.6f    Std: %.6f" % (times.mean(), times.std()))
