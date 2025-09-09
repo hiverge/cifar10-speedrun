@@ -6,7 +6,6 @@ This repository contains a script that trains a neural network to **94% accuracy
 | :--- | :--- | :--- |
 | **`cifar10_speedrun.py`** | **94.01%** | **2.095s** |
 | `airbench94_muon.py` | 94.01% | 2.59s |
-| Standard ResNet-18 training | 96.0% | 7min |
 
 ## 🚀 Quickstart
 
