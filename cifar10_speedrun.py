@@ -459,7 +459,7 @@ def infer(model, loader, tta_level=0):
         with torch.no_grad():
             model.eval()
             device = test_images.device
-            B = 1250
+            B = 2000
             pad = 1
             n = test_images.shape[0]
             all_logits_list = []
@@ -484,7 +484,7 @@ def infer(model, loader, tta_level=0):
             final_logits = initial_logits.clone()
             tta_logits_parts = []
 
-            tta_batch_size = 1250
+            tta_batch_size = 2000
             for i in range(0, k_uncertain, tta_batch_size):
                 batch_indices_for_tta = uncertain_indices[
                     i : min(i + tta_batch_size, k_uncertain)
@@ -524,7 +524,7 @@ def main(run, model):
     bias_lr = 0.05
     head_lr = 0.7
     wd = 1.2e-06 * training_batch_size
-    test_loader = CifarLoader("cifar10", train=False, batch_size=1250)
+    test_loader = CifarLoader("cifar10", train=False, batch_size=2000)
     train_loader = CifarLoader(
         "cifar10",
         train=True,
@@ -618,20 +618,8 @@ def main(run, model):
                 group["lr"] = group["initial_lr"] * (
                     1 - step / max(1, whiten_bias_train_steps)
                 )
-            warmup_steps = int(total_train_steps * 0.035)
-            min_lr_ratio = 0.01
-            for group in optimizer1.param_groups[1:] + optimizer2.param_groups:
-                initial_lr = group["initial_lr"]
-                if step < warmup_steps:
-                    current_lr = initial_lr * (step / max(1, warmup_steps))
-                else:
-                    decay_total_steps = total_train_steps - warmup_steps
-                    decay_progress = (step - warmup_steps) / max(1, decay_total_steps)
-                    current_lr = initial_lr * (
-                        1.0 - decay_progress * (1.0 - min_lr_ratio)
-                    )
-                    current_lr = max(current_lr, initial_lr * min_lr_ratio)
-                group["lr"] = current_lr
+            for group in optimizer1.param_groups[1:]+optimizer2.param_groups:
+                group["lr"] = group["initial_lr"] * (1 - step / total_train_steps)
 
             for opt in optimizers:
                 opt.step()
@@ -671,6 +659,7 @@ if __name__ == "__main__":
         print(
             f"Mean accuracy after {run + 1} runs: {sum(accs_so_far) / len(accs_so_far):.6f} | Mean time: {sum(times_so_far) / len(times_so_far):.6f}s", end='\r', flush=True
         )
+    print()
     _, accs, times = zip(*results)
     accs = torch.tensor(accs)
     times = torch.tensor(times)
