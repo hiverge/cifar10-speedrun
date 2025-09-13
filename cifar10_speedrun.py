@@ -111,18 +111,18 @@ class Muon(torch.optim.Optimizer):
             (max(1, self.max_K) + 15) // 16 * 16
         )
         # Initialize a dictionary to retain gradient norms
-        self.retained_gradient_norms = {} 
+        self.retained_gradient_norms = {}
 
     @torch.no_grad()
     def step(self):
         self.step_count += 1
         group = self.param_groups[0]
-        
+
         # Prepare momentum buffers and track meta data
         filter_params_with_grad = []
         filter_meta_for_current_step = []
         momentum_buffers = [] if group["momentum_buffer_dtype"] == torch.half else None
-        
+
         for p_meta in self.filter_params_meta:
             p = p_meta["param"]
             if p.grad is not None:
@@ -140,10 +140,10 @@ class Muon(torch.optim.Optimizer):
                     p_meta["reshaped_dims"][1],
                     len(filter_params_with_grad) - 1  # Index in filter_params_with_grad
                 ))
-        
+
         if not filter_params_with_grad:
             return
-        
+
         # Apply momentum and add gradients
         if momentum_buffers is not None:
             torch._foreach_mul_(momentum_buffers, group["momentum"])
@@ -151,13 +151,13 @@ class Muon(torch.optim.Optimizer):
             torch._foreach_add_(momentum_buffers, grad_casts)
         else:
             momentum_buffers = [p.grad for p in filter_params_with_grad]
-        
+
         if group["nesterov"]:
             nesterov_grads = torch._foreach_add(
                 [p.grad for p in filter_params_with_grad], momentum_buffers, alpha=group["momentum"])
         else:
             nesterov_grads = momentum_buffers
-        
+
         if group["norm_freq"] > 0 and self.step_count % group["norm_freq"] == 0:
             norms = torch._foreach_norm(filter_params_with_grad)
             self.retained_gradient_norms[self.step_count] = norms
@@ -165,7 +165,7 @@ class Muon(torch.optim.Optimizer):
                 (len(p.data) ** 0.5 / (n + 1e-07)).to(p.data.dtype)
                 for p, n in zip(filter_params_with_grad, norms)]
             torch._foreach_mul_(filter_params_with_grad, scale_factors)
-        
+
         final_orthogonalized_grads = _zeropower_via_newtonschulz5(
             nesterov_grads,
             filter_meta_for_current_step,
@@ -174,15 +174,28 @@ class Muon(torch.optim.Optimizer):
             self.step_count,
             self.total_train_steps,
         )
-        
+
         # Apply optimizer step
         torch._foreach_add_(
-            filter_params_with_grad, 
-            final_orthogonalized_grads, 
+            filter_params_with_grad,
+            final_orthogonalized_grads,
             alpha=-group["lr"])
         # Apply weight decay
         for param in filter_params_with_grad:
             param.data.mul_(1 - group["lr"] * group["weight_decay"])
+
+    def zero_grad(self, set_to_none: bool = False):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    if set_to_none:
+                        p.grad = None
+                    else:
+                        if p.grad.grad_fn is not None:
+                            p.grad.detach_()
+                        else:
+                            p.grad.requires_grad_(False)
+                        p.grad.zero_()
 
 
 CIFAR_MEAN = torch.tensor((0.4914, 0.4822, 0.4465), dtype=torch.half)
@@ -380,7 +393,7 @@ class CifarNet(nn.Module):
             if hasattr(m, "reset_parameters"):
                 m.reset_parameters()
         w = self.head.weight.data
-        w *= 1 / w.std()
+        w.mul_(1.0 / w.std())
 
     def init_whiten(self, train_images, eps=0.0005):
         c, (h, w) = (train_images.shape[1], self.whiten.weight.shape[2:])
@@ -466,7 +479,7 @@ def infer(model, loader, tta_level=0):
         with torch.no_grad():
             model.eval()
             device = test_images.device
-            B = 4000
+            B = 2000
             pad = 1
             n = test_images.shape[0]
             all_logits_list = []
@@ -478,14 +491,14 @@ def infer(model, loader, tta_level=0):
             initial_logits = torch.cat(all_logits_list, dim=0)
             probs = F.softmax(initial_logits, dim=1)
             confidences, _ = probs.max(dim=1)
-            UNCERTAIN_QUANTILE = 0.15
+            UNCERTAIN_QUANTILE = 0.20
             k_uncertain = int(n * UNCERTAIN_QUANTILE)
             _, uncertain_indices = torch.topk(
                 confidences, k_uncertain, largest=False, sorted=False
             )
 
             tta_logits_parts = []
-            tta_batch_size = 2500
+            tta_batch_size = 1000
             for i in range(0, k_uncertain, tta_batch_size):
                 cur_batch_size = min(tta_batch_size, k_uncertain - i)
                 batch_indices = uncertain_indices[i : i + cur_batch_size]
@@ -507,10 +520,10 @@ def infer(model, loader, tta_level=0):
     test_images = loader.normalize(loader.images)
     if tta_level < 2:
         model.eval()
-        infer_fn = [infer_basic, infer_mirror, tta][tta_level]
+        infer_fn = [infer_basic, infer_mirror, None][tta_level]
         with torch.no_grad():
             return torch.cat(
-                [infer_fn(inputs, model) for inputs in test_images.split(2500)]
+                [infer_fn(inputs, model) for inputs in test_images.split(2000)]
             )
     else:  # tta_level == 2
         return tta(model, test_images)
@@ -540,7 +553,7 @@ def main(run, model):
                 "contrast_range": 0.15,
             },
         },
-    )
+        )
     if run == "warmup":
         train_loader.labels = torch.randint(
             0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device
@@ -554,7 +567,7 @@ def main(run, model):
         test_loader.images = torch.randn_like(
             test_loader.images, device=test_loader.images.device
         )
-    total_train_steps = ceil(7.8 * len(train_loader))
+    total_train_steps = ceil(7.7 * len(train_loader))
     whiten_bias_train_steps = ceil(0.3 * len(train_loader))
     model.reset()
     filter_params = [
@@ -573,7 +586,7 @@ def main(run, model):
     )
     optimizer2 = Muon(
         filter_params,
-        lr=0.2,
+        lr=0.20,
         momentum=0.65,
         nesterov=True,
         norm_freq=4,
