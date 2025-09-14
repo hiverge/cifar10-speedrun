@@ -1,11 +1,12 @@
---- Starting Sequential Run 1 at Wed Sep 10 15:09:59 UTC 2025 ---
---- Starting Sequential Run 2 at Wed Sep 10 15:33:29 UTC 2025 ---
---- Starting Sequential Run 3 at Wed Sep 10 15:56:55 UTC 2025 ---
---- Starting Sequential Run 4 at Wed Sep 10 16:20:23 UTC 2025 ---
---- Starting Sequential Run 5 at Wed Sep 10 16:43:50 UTC 2025 ---
---- Starting Sequential Run 6 at Wed Sep 10 17:07:17 UTC 2025 ---
---- Starting Sequential Run 7 at Wed Sep 10 17:30:44 UTC 2025 ---
---- Starting Sequential Run 8 at Wed Sep 10 17:54:14 UTC 2025 ---
---- Starting Sequential Run 9 at Wed Sep 10 18:17:50 UTC 2025 ---
---- Starting Sequential Run 10 at Wed Sep 10 18:41:21 UTC 2025 ---
---- All 10 runs completed at Wed Sep 10 19:04:57 UTC 2025 ---
+nice: cannot set niceness: Permission denied
+--- Starting Sequential Run 1 at Sat Sep 13 10:41:06 UTC 2025 ---
+--- Starting Sequential Run 2 at Sat Sep 13 11:04:13 UTC 2025 ---
+--- Starting Sequential Run 3 at Sat Sep 13 11:27:20 UTC 2025 ---
+--- Starting Sequential Run 4 at Sat Sep 13 11:50:31 UTC 2025 ---
+--- Starting Sequential Run 5 at Sat Sep 13 12:13:42 UTC 2025 ---
+--- Starting Sequential Run 6 at Sat Sep 13 12:36:49 UTC 2025 ---
+--- Starting Sequential Run 7 at Sat Sep 13 12:59:56 UTC 2025 ---
+--- Starting Sequential Run 8 at Sat Sep 13 13:23:05 UTC 2025 ---
+--- Starting Sequential Run 9 at Sat Sep 13 13:46:12 UTC 2025 ---
+--- Starting Sequential Run 10 at Sat Sep 13 14:09:22 UTC 2025 ---
+--- All 10 runs completed at Sat Sep 13 14:32:32 UTC 2025 ---

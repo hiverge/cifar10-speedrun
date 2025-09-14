@@ -109,59 +109,63 @@ class Muon(torch.optim.Optimizer):
         self.max_D = max(1, self.max_D)
         self.max_K = (
             (max(1, self.max_K) + 15) // 16 * 16
-        ) 
+        )
+        # Initialize a dictionary to retain gradient norms
+        self.retained_gradient_norms = {}
 
     @torch.no_grad()
     def step(self):
         self.step_count += 1
         group = self.param_groups[0]
+
+        # Prepare momentum buffers and track meta data
         filter_params_with_grad = []
-        original_grad_list = []
-        momentum_buffers = []
         filter_meta_for_current_step = []
-        temp_filter_grad_idx = 0
+        momentum_buffers = [] if group["momentum_buffer_dtype"] == torch.half else None
+
         for p_meta in self.filter_params_meta:
             p = p_meta["param"]
             if p.grad is not None:
                 filter_params_with_grad.append(p)
-                original_grad_list.append(p.grad)
                 state = self.state[p]
                 if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(
-                        p.grad,
+                    state["momentum_buffer"] = torch.zeros_like(p.grad,
                         dtype=group["momentum_buffer_dtype"],
-                        memory_format=torch.preserve_format,
-                    )
-                momentum_buffers.append(state["momentum_buffer"])
-                filter_meta_for_current_step.append(
-                    (
-                        p_meta["original_shape"],
-                        p_meta["reshaped_dims"][0],
-                        p_meta["reshaped_dims"][1],
-                        temp_filter_grad_idx,
-                    )
-                )
-                temp_filter_grad_idx += 1
+                        memory_format=torch.preserve_format)
+                if momentum_buffers is not None:
+                    momentum_buffers.append(state["momentum_buffer"])
+                filter_meta_for_current_step.append((
+                    p_meta["original_shape"],
+                    p_meta["reshaped_dims"][0],
+                    p_meta["reshaped_dims"][1],
+                    len(filter_params_with_grad) - 1  # Index in filter_params_with_grad
+                ))
+
         if not filter_params_with_grad:
             return
-        grad_casts = [
-            g.to(mb.dtype) for g, mb in zip(original_grad_list, momentum_buffers)
-        ]
-        torch._foreach_mul_(momentum_buffers, group["momentum"])
-        torch._foreach_add_(momentum_buffers, grad_casts)
+
+        # Apply momentum and add gradients
+        if momentum_buffers is not None:
+            torch._foreach_mul_(momentum_buffers, group["momentum"])
+            grad_casts = [g.to(mb.dtype) for g, mb in zip([p.grad for p in filter_params_with_grad], momentum_buffers)]
+            torch._foreach_add_(momentum_buffers, grad_casts)
+        else:
+            momentum_buffers = [p.grad for p in filter_params_with_grad]
+
         if group["nesterov"]:
             nesterov_grads = torch._foreach_add(
-                grad_casts, momentum_buffers, alpha=group["momentum"]
-            )
+                [p.grad for p in filter_params_with_grad], momentum_buffers, alpha=group["momentum"])
         else:
             nesterov_grads = momentum_buffers
+
         if group["norm_freq"] > 0 and self.step_count % group["norm_freq"] == 0:
             norms = torch._foreach_norm(filter_params_with_grad)
+            self.retained_gradient_norms[self.step_count] = norms
             scale_factors = [
                 (len(p.data) ** 0.5 / (n + 1e-07)).to(p.data.dtype)
-                for p, n in zip(filter_params_with_grad, norms)
-            ]
+                for p, n in zip(filter_params_with_grad, norms)]
             torch._foreach_mul_(filter_params_with_grad, scale_factors)
+
         final_orthogonalized_grads = _zeropower_via_newtonschulz5(
             nesterov_grads,
             filter_meta_for_current_step,
@@ -170,12 +174,28 @@ class Muon(torch.optim.Optimizer):
             self.step_count,
             self.total_train_steps,
         )
-        # Apply weight decay
-        for param, grad in zip(filter_params_with_grad, final_orthogonalized_grads):
-            param.data.mul_(1 - group["lr"] * group["weight_decay"])
+
+        # Apply optimizer step
         torch._foreach_add_(
-            filter_params_with_grad, final_orthogonalized_grads, alpha=-group["lr"]
-        )
+            filter_params_with_grad,
+            final_orthogonalized_grads,
+            alpha=-group["lr"])
+        # Apply weight decay
+        for param in filter_params_with_grad:
+            param.data.mul_(1 - group["lr"] * group["weight_decay"])
+
+    def zero_grad(self, set_to_none: bool = False):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    if set_to_none:
+                        p.grad = None
+                    else:
+                        if p.grad.grad_fn is not None:
+                            p.grad.detach_()
+                        else:
+                            p.grad.requires_grad_(False)
+                        p.grad.zero_()
 
 
 CIFAR_MEAN = torch.tensor((0.4914, 0.4822, 0.4465), dtype=torch.half)
@@ -373,7 +393,7 @@ class CifarNet(nn.Module):
             if hasattr(m, "reset_parameters"):
                 m.reset_parameters()
         w = self.head.weight.data
-        w *= 1 / w.std()
+        w.mul_(1.0 / w.std())
 
     def init_whiten(self, train_images, eps=0.0005):
         c, (h, w) = (train_images.shape[1], self.whiten.weight.shape[2:])
@@ -471,41 +491,36 @@ def infer(model, loader, tta_level=0):
             initial_logits = torch.cat(all_logits_list, dim=0)
             probs = F.softmax(initial_logits, dim=1)
             confidences, _ = probs.max(dim=1)
-            UNCERTAIN_QUANTILE = 0.2
+            UNCERTAIN_QUANTILE = 0.20
             k_uncertain = int(n * UNCERTAIN_QUANTILE)
             _, uncertain_indices = torch.topk(
                 confidences, k_uncertain, largest=False, sorted=False
             )
-            num_tta_slots = (k_uncertain + B - 1) // B * B
-            tta_indices_to_process = torch.empty(
-                num_tta_slots, dtype=torch.long, device=device
-            )
-            tta_indices_to_process[:k_uncertain] = uncertain_indices
-            final_logits = initial_logits.clone()
+
             tta_logits_parts = []
-
-            tta_batch_size = 2000
+            tta_batch_size = 1000
             for i in range(0, k_uncertain, tta_batch_size):
-                batch_indices_for_tta = uncertain_indices[
-                    i : min(i + tta_batch_size, k_uncertain)
-                ]
-                images_batch_for_tta = test_images[batch_indices_for_tta]
-
-                combined_tta_logits_batch = _get_tta_logits(
+                cur_batch_size = min(tta_batch_size, k_uncertain - i)
+                batch_indices = uncertain_indices[i : i + cur_batch_size]
+                images_batch = test_images[batch_indices]
+                logits_batch = _get_tta_logits(
                     model,
-                    images_batch_for_tta.contiguous(memory_format=torch.channels_last),
+                    images_batch.contiguous(memory_format=torch.channels_last),
                     pad,
                 )
-                tta_logits_parts.append(combined_tta_logits_batch)
+                tta_logits_parts.append(logits_batch)
 
-            all_tta_logits_for_uncertain = torch.cat(tta_logits_parts, dim=0)
-            final_logits[uncertain_indices] = all_tta_logits_for_uncertain
-            return final_logits
+            if tta_logits_parts:
+                all_tta_logits_for_uncertain = torch.cat(tta_logits_parts, dim=0)
+                final_logits = initial_logits.clone()
+                final_logits[uncertain_indices] = all_tta_logits_for_uncertain
+                return final_logits
+            return initial_logits
 
     test_images = loader.normalize(loader.images)
     if tta_level < 2:
         model.eval()
-        infer_fn = [infer_basic, infer_mirror, tta][tta_level]
+        infer_fn = [infer_basic, infer_mirror, None][tta_level]
         with torch.no_grad():
             return torch.cat(
                 [infer_fn(inputs, model) for inputs in test_images.split(2000)]
@@ -520,7 +535,7 @@ def evaluate(model, loader, tta_level=0):
 
 
 def main(run, model):
-    training_batch_size = 1500
+    training_batch_size = 1536
     bias_lr = 0.05
     head_lr = 0.7
     wd = 1.2e-06 * training_batch_size
@@ -534,11 +549,11 @@ def main(run, model):
             "translate": 2,
             "color_jitter": {
                 "enabled": True,
-                "brightness_range": 0.18,
-                "contrast_range": 0.18,
+                "brightness_range": 0.15,
+                "contrast_range": 0.15,
             },
         },
-    )
+        )
     if run == "warmup":
         train_loader.labels = torch.randint(
             0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device
@@ -552,7 +567,7 @@ def main(run, model):
         test_loader.images = torch.randn_like(
             test_loader.images, device=test_loader.images.device
         )
-    total_train_steps = ceil(7.67 * len(train_loader))
+    total_train_steps = ceil(7.7 * len(train_loader))
     whiten_bias_train_steps = ceil(0.3 * len(train_loader))
     model.reset()
     filter_params = [
@@ -567,14 +582,14 @@ def main(run, model):
         dict(params=[model.head.weight], lr=head_lr, weight_decay=wd / head_lr),
     ]
     optimizer1 = torch.optim.SGD(
-        param_configs, momentum=0.83, nesterov=True, fused=True
+        param_configs, momentum=0.85, nesterov=True, fused=True
     )
     optimizer2 = Muon(
         filter_params,
-        lr=0.22,
-        momentum=0.62,
+        lr=0.20,
+        momentum=0.65,
         nesterov=True,
-        norm_freq=6,
+        norm_freq=4,
         total_train_steps=total_train_steps,
         weight_decay=wd,
     )
@@ -599,13 +614,14 @@ def main(run, model):
     model.reset()
     step = 0
     start_timer()
-    train_images = train_loader.normalize(train_loader.images[:4500])
-    model.init_whiten(train_images)
+    with torch.no_grad():
+        train_images = train_loader.normalize(train_loader.images[:1024])
+        model.init_whiten(train_images)
 
     @torch.compile(mode="max-autotune")
     def train_step(inputs, labels, step, whiten_bias_train_steps, total_train_steps):
         outputs = model(inputs, whiten_bias_grad=step < whiten_bias_train_steps)
-        loss = F.cross_entropy(outputs, labels, label_smoothing=0.08, reduction="sum")
+        loss = F.cross_entropy(outputs, labels, label_smoothing=0.1, reduction="sum")
         loss.backward()
         return loss
 
@@ -614,12 +630,14 @@ def main(run, model):
         for inputs, labels in train_loader:
             train_step(inputs, labels, step, whiten_bias_train_steps, total_train_steps)
 
+            # Optimize LR scheduling
+            lr_factor1 = 1 - step / max(1, whiten_bias_train_steps)
+            lr_factor2 = 1 - step / total_train_steps
+
             for group in optimizer1.param_groups[:1]:
-                group["lr"] = group["initial_lr"] * (
-                    1 - step / max(1, whiten_bias_train_steps)
-                )
-            for group in optimizer1.param_groups[1:]+optimizer2.param_groups:
-                group["lr"] = group["initial_lr"] * (1 - step / total_train_steps)
+                group["lr"] = group["initial_lr"] * lr_factor1
+            for group in optimizer1.param_groups[1:] + optimizer2.param_groups:
+                group["lr"] = group["initial_lr"] * lr_factor2
 
             for opt in optimizers:
                 opt.step()
