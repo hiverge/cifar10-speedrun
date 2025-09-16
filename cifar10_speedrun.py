@@ -18,13 +18,13 @@ def _zeropower_via_newtonschulz5(
     current_step: int,
     total_steps: int,
 ) -> list[torch.half]:
-    a, b, c = (3.4445, -4.775, 2.0315)
+    a, b, c = (3.4576, -4.7391, 2.0843)
     eps_stable = 1e-05
     eps_gms = 1e-05
     progress_ratio = current_step / max(1, total_steps)
 
-    initial_target_mag = 0.5
-    final_target_mag = 0.08
+    initial_target_mag = 0.5012
+    final_target_mag = 0.0786
     target_magnitude = (
         initial_target_mag * (1 - progress_ratio) + final_target_mag * progress_ratio
     )
@@ -320,7 +320,7 @@ class CifarLoader:
 
 
 class BatchNorm(nn.BatchNorm2d):
-    def __init__(self, num_features, momentum=0.58, eps=1e-12):
+    def __init__(self, num_features, momentum=0.5566, eps=1e-12):
         super().__init__(num_features, eps=eps, momentum=1 - momentum)
         self.weight.requires_grad = False
 
@@ -491,7 +491,7 @@ def infer(model, loader, tta_level=0):
             initial_logits = torch.cat(all_logits_list, dim=0)
             probs = F.softmax(initial_logits, dim=1)
             confidences, _ = probs.max(dim=1)
-            UNCERTAIN_QUANTILE = 0.20
+            UNCERTAIN_QUANTILE = 0.2
             k_uncertain = int(n * UNCERTAIN_QUANTILE)
             _, uncertain_indices = torch.topk(
                 confidences, k_uncertain, largest=False, sorted=False
@@ -536,9 +536,9 @@ def evaluate(model, loader, tta_level=0):
 
 def main(run, model):
     training_batch_size = 1536
-    bias_lr = 0.05
-    head_lr = 0.7
-    wd = 1.2e-06 * training_batch_size
+    bias_lr = 0.0573
+    head_lr = 0.5415
+    wd = 1.0418e-06 * training_batch_size
     test_loader = CifarLoader("cifar10", train=False, batch_size=2000)
     train_loader = CifarLoader(
         "cifar10",
@@ -549,8 +549,8 @@ def main(run, model):
             "translate": 2,
             "color_jitter": {
                 "enabled": True,
-                "brightness_range": 0.15,
-                "contrast_range": 0.15,
+                "brightness_range": 0.1399,
+                "contrast_range": 0.1308,
             },
         },
         )
@@ -567,8 +567,8 @@ def main(run, model):
         test_loader.images = torch.randn_like(
             test_loader.images, device=test_loader.images.device
         )
-    total_train_steps = ceil(7.7 * len(train_loader))
-    whiten_bias_train_steps = ceil(0.3 * len(train_loader))
+    total_train_steps = ceil(7.65 * len(train_loader))
+    whiten_bias_train_steps = ceil(0.21 * len(train_loader))
     model.reset()
     filter_params = [
         p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad
@@ -582,12 +582,12 @@ def main(run, model):
         dict(params=[model.head.weight], lr=head_lr, weight_decay=wd / head_lr),
     ]
     optimizer1 = torch.optim.SGD(
-        param_configs, momentum=0.85, nesterov=True, fused=True
+        param_configs, momentum=0.8192, nesterov=True, fused=True
     )
     optimizer2 = Muon(
         filter_params,
-        lr=0.20,
-        momentum=0.65,
+        lr=0.2073,
+        momentum=0.6524,
         nesterov=True,
         norm_freq=4,
         total_train_steps=total_train_steps,
@@ -615,13 +615,13 @@ def main(run, model):
     step = 0
     start_timer()
     with torch.no_grad():
-        train_images = train_loader.normalize(train_loader.images[:1024])
+        train_images = train_loader.normalize(train_loader.images[:1120])
         model.init_whiten(train_images)
 
     @torch.compile(mode="max-autotune")
     def train_step(inputs, labels, step, whiten_bias_train_steps, total_train_steps):
         outputs = model(inputs, whiten_bias_grad=step < whiten_bias_train_steps)
-        loss = F.cross_entropy(outputs, labels, label_smoothing=0.1, reduction="sum")
+        loss = F.cross_entropy(outputs, labels, label_smoothing=0.0915, reduction="sum")
         loss.backward()
         return loss
 
@@ -677,7 +677,6 @@ if __name__ == "__main__":
         print(
             f"Mean accuracy after {run + 1} runs: {sum(accs_so_far) / len(accs_so_far):.6f} | Mean time: {sum(times_so_far) / len(times_so_far):.6f}s", end='\r', flush=True
         )
-    print()
     _, accs, times = zip(*results)
     accs = torch.tensor(accs)
     times = torch.tensor(times)
