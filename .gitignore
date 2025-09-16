@@ -1,0 +1,11 @@
+.DS_Store
+.vscode
+
+*.pyc
+__pycache__
+**/__pycache__/
+.mypy_cache/
+.empty/
+.pytest_cache/
+
+dist/
