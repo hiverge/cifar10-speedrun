@@ -9,7 +9,7 @@ import torchvision.transforms as T
 torch.backends.cudnn.benchmark = True
 
 
-@torch.compile
+@torch.compile(fullgraph=True)
 def _zeropower_via_newtonschulz5(
     gradients_4d: list[torch.half],
     filter_meta_data: list[tuple],
@@ -28,15 +28,24 @@ def _zeropower_via_newtonschulz5(
     target_magnitude = (
         initial_target_mag * (1 - progress_ratio) + final_target_mag * progress_ratio
     )
-    padded_grads_batch = []
+
+    # Use stack instead of pre-allocated tensor for better performance
+    if not filter_meta_data:
+        return gradients_4d
+
+    grad_list = []
     for meta in filter_meta_data:
         original_shape, reshaped_D, reshaped_K, list_idx = meta
         grad_to_orthogonalize = gradients_4d[list_idx]
         g_reshaped = grad_to_orthogonalize.reshape(reshaped_D, reshaped_K)
         padding_dims = (0, max_K - reshaped_K, 0, max_D - reshaped_D)
         g_padded = F.pad(g_reshaped, padding_dims, "constant", 0)
-        padded_grads_batch.append(g_padded)
-    X = torch.stack(padded_grads_batch)
+        grad_list.append(g_padded)
+
+    if not grad_list:
+        return gradients_4d
+
+    X = torch.stack(grad_list)
     current_batch_mags = X.norm(dim=(1, 2), keepdim=True)
     X = X * (target_magnitude / (current_batch_mags + eps_gms))
     X_norm = X.norm(dim=(1, 2), keepdim=True)
@@ -110,8 +119,7 @@ class Muon(torch.optim.Optimizer):
         self.max_K = (
             (max(1, self.max_K) + 15) // 16 * 16
         )
-        # Initialize a dictionary to retain gradient norms
-        self.retained_gradient_norms = {}
+        self.current_grad_norms = None
 
     @torch.no_grad()
     def step(self):
@@ -158,13 +166,12 @@ class Muon(torch.optim.Optimizer):
         else:
             nesterov_grads = momentum_buffers
 
-        if group["norm_freq"] > 0 and self.step_count % group["norm_freq"] == 0:
-            norms = torch._foreach_norm(filter_params_with_grad)
-            self.retained_gradient_norms[self.step_count] = norms
+        do_norm_scaling = group["norm_freq"] > 0 and self.step_count % group["norm_freq"] == 0
+        if do_norm_scaling:
+            self.current_grad_norms = torch._foreach_norm(filter_params_with_grad)
             scale_factors = [
                 (len(p.data) ** 0.5 / (n + 1e-07)).to(p.data.dtype)
-                for p, n in zip(filter_params_with_grad, norms)]
-            torch._foreach_mul_(filter_params_with_grad, scale_factors)
+                for p, n in zip(filter_params_with_grad, self.current_grad_norms)]
 
         final_orthogonalized_grads = _zeropower_via_newtonschulz5(
             nesterov_grads,
@@ -175,16 +182,28 @@ class Muon(torch.optim.Optimizer):
             self.total_train_steps,
         )
 
-        # Apply optimizer step
-        torch._foreach_add_(
-            filter_params_with_grad,
-            final_orthogonalized_grads,
-            alpha=-group["lr"])
-        # Apply weight decay
-        for param in filter_params_with_grad:
-            param.data.mul_(1 - group["lr"] * group["weight_decay"])
+        # Apply updates in a single fused operation when possible
+        if do_norm_scaling:
+            # Scale gradients first
+            torch._foreach_mul_(filter_params_with_grad, scale_factors)
+            # Then apply the orthogonalized updates
+            torch._foreach_add_(
+                filter_params_with_grad,
+                final_orthogonalized_grads,
+                alpha=-group["lr"])
+        else:
+            # Apply optimizer step directly
+            torch._foreach_add_(
+                filter_params_with_grad,
+                final_orthogonalized_grads,
+                alpha=-group["lr"])
 
-    def zero_grad(self, set_to_none: bool = False):
+        # Apply weight decay in a fused operation
+        weight_decay_factor = 1 - group["lr"] * group["weight_decay"]
+        if weight_decay_factor != 1.0:
+            torch._foreach_mul_(filter_params_with_grad, weight_decay_factor)
+
+    def zero_grad(self, set_to_none: bool = True):
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is not None:
@@ -210,10 +229,10 @@ def batch_color_jitter(inputs, brightness_range: float, contrast_range: float):
     brightness_shift = (
         torch.rand(B, 1, 1, 1, device=device, dtype=dtype) * 2 - 1
     ) * brightness_range
-    inputs = inputs + brightness_shift
     contrast_scale = (
         torch.rand(B, 1, 1, 1, device=device, dtype=dtype) * 2 - 1
     ) * contrast_range + 1
+    inputs = inputs + brightness_shift
     inputs = inputs * contrast_scale
     return inputs
 
@@ -385,7 +404,7 @@ class CifarNet(nn.Module):
         b = self.whiten.bias
         x = F.conv2d(x, self.whiten.weight, b if whiten_bias_grad else b.detach())
         x = self.layers(x)
-        x = x.view(len(x), -1)
+        x = x.view(len(x), -1).contiguous()
         return self.head(x) / x.size(-1)
 
     def reset(self):
@@ -459,7 +478,7 @@ def infer(model, loader, tta_level=0):
     def infer_mirror(inputs, net):
         return 0.5 * net(inputs) + 0.5 * net(inputs.flip(-1))
 
-    @torch.compile
+    @torch.compile(fullgraph=True)
     def _get_tta_logits(model, images_batch, pad):
         batch_size = images_batch.shape[0]
         padded_inputs = F.pad(images_batch, (pad,) * 4, "reflect")
@@ -567,8 +586,8 @@ def main(run, model):
         test_loader.images = torch.randn_like(
             test_loader.images, device=test_loader.images.device
         )
-    total_train_steps = ceil(7.65 * len(train_loader))
-    whiten_bias_train_steps = ceil(0.21 * len(train_loader))
+    total_train_steps = ceil(7.63 * len(train_loader))
+    whiten_bias_train_steps = ceil(0.19 * len(train_loader))
     model.reset()
     filter_params = [
         p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad
@@ -582,14 +601,14 @@ def main(run, model):
         dict(params=[model.head.weight], lr=head_lr, weight_decay=wd / head_lr),
     ]
     optimizer1 = torch.optim.SGD(
-        param_configs, momentum=0.8192, nesterov=True, fused=True
+        param_configs, momentum=0.825, nesterov=True, fused=True
     )
     optimizer2 = Muon(
         filter_params,
-        lr=0.2073,
-        momentum=0.6524,
+        lr=0.205,
+        momentum=0.655,
         nesterov=True,
-        norm_freq=4,
+        norm_freq=8,
         total_train_steps=total_train_steps,
         weight_decay=wd,
     )
@@ -611,28 +630,34 @@ def main(run, model):
         nonlocal time_seconds
         time_seconds += 0.001 * starter.elapsed_time(ender)
 
+    # Warm up CUDA context
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
     model.reset()
     step = 0
     start_timer()
     with torch.no_grad():
-        train_images = train_loader.normalize(train_loader.images[:1120])
+        train_images = train_loader.normalize(train_loader.images[:960])
         model.init_whiten(train_images)
 
     @torch.compile(mode="max-autotune")
     def train_step(inputs, labels, step, whiten_bias_train_steps, total_train_steps):
         outputs = model(inputs, whiten_bias_grad=step < whiten_bias_train_steps)
-        loss = F.cross_entropy(outputs, labels, label_smoothing=0.0915, reduction="sum")
+        loss = F.cross_entropy(outputs, labels, label_smoothing=0.09, reduction="sum")
         loss.backward()
         return loss
+
+    lr_factor1_base = 1.0 / max(1, whiten_bias_train_steps)
+    lr_factor2_base = 1.0 / total_train_steps
 
     for epoch in range(ceil(total_train_steps / len(train_loader))):
         model.train()
         for inputs, labels in train_loader:
             train_step(inputs, labels, step, whiten_bias_train_steps, total_train_steps)
 
-            # Optimize LR scheduling
-            lr_factor1 = 1 - step / max(1, whiten_bias_train_steps)
-            lr_factor2 = 1 - step / total_train_steps
+            lr_factor1 = 1 - step * lr_factor1_base
+            lr_factor2 = 1 - step * lr_factor2_base
 
             for group in optimizer1.param_groups[:1]:
                 group["lr"] = group["initial_lr"] * lr_factor1
@@ -641,8 +666,6 @@ def main(run, model):
 
             for opt in optimizers:
                 opt.step()
-
-            for opt in optimizers:
                 opt.zero_grad(set_to_none=True)
 
             step += 1
@@ -675,7 +698,7 @@ if __name__ == "__main__":
         accs_so_far = [a for _, a, _ in results]
         times_so_far = [t for _, _, t in results]
         print(
-            f"Mean accuracy after {run + 1} runs: {sum(accs_so_far) / len(accs_so_far):.6f} | Mean time: {sum(times_so_far) / len(times_so_far):.6f}s\n", end='\r', flush=True
+            f"Mean accuracy after {run + 1} runs: {sum(accs_so_far) / len(accs_so_far):.6f} | Mean time: {sum(times_so_far) / len(times_so_far):.6f}s", end='\r', flush=True
         )
     _, accs, times = zip(*results)
     accs = torch.tensor(accs)
