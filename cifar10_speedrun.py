@@ -108,6 +108,7 @@ class Muon(torch.optim.Optimizer):
         )
         super().__init__(params, defaults)
         self.step_count = 0
+        self.last_norm_step = 0
         self.total_train_steps = total_train_steps
         self.filter_params_meta = []
         self.max_D, self.max_K = (0, 0)
@@ -135,7 +136,8 @@ class Muon(torch.optim.Optimizer):
     def step(self):
         self.step_count += 1
         group = self.param_groups[0]
-
+        progress = self.step_count / self.total_train_steps
+        group["norm_freq"] = 2 + int(15 * progress)
         # Prepare momentum buffers and track meta data
         filter_params_with_grad = []
         filter_meta_for_current_step = []
@@ -176,8 +178,9 @@ class Muon(torch.optim.Optimizer):
         else:
             nesterov_grads = momentum_buffers
 
-        do_norm_scaling = group["norm_freq"] > 0 and self.step_count % group["norm_freq"] == 0
+        do_norm_scaling = (self.step_count - self.last_norm_step >= group["norm_freq"])
         if do_norm_scaling:
+            self.last_norm_step = self.step_count
             self.current_grad_norms = torch._foreach_norm(filter_params_with_grad)
             scale_factors = [
                 (len(p.data) ** 0.5 / (n + 1e-07)).to(p.data.dtype)
@@ -446,12 +449,12 @@ class CifarNet(nn.Module):
             .float()
         )
         patches_flat = patches.view(len(patches), -1)
-        # Use more efficient covariance computation
+        # Use more efficient covariance computation with SVD for better numerical stability
         est_patch_covariance = torch.mm(patches_flat.t(), patches_flat) / len(patches_flat)
-        eigenvalues, eigenvectors = torch.linalg.eigh(est_patch_covariance, UPLO="U")
-        eigenvectors_scaled = eigenvectors.T.reshape(-1, c, h, w) / torch.sqrt(
-            eigenvalues.view(-1, 1, 1, 1) + eps
-        )
+        U, S, V = torch.svd(est_patch_covariance)
+        # More stable inverse square root computation
+        inv_sqrt_S = torch.rsqrt(S + eps)
+        eigenvectors_scaled = (U * inv_sqrt_S.unsqueeze(0)).T.reshape(-1, c, h, w)
         self.whiten.weight.data[:] = torch.cat(
             (eigenvectors_scaled, -eigenvectors_scaled)
         )
