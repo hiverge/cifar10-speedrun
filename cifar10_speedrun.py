@@ -1,5 +1,14 @@
+#############################################
+#                  Setup                    #
+#############################################
+
 import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read()
+import uuid
 from math import ceil
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -8,6 +17,9 @@ import torchvision.transforms as T
 
 torch.backends.cudnn.benchmark = True
 
+#############################################
+#               Muon optimizer              #
+#############################################
 
 @torch.compile(fullgraph=True)
 def _zeropower_via_newtonschulz5(
@@ -229,10 +241,12 @@ class Muon(torch.optim.Optimizer):
                             p.grad.requires_grad_(False)
                         p.grad.zero_()
 
+#############################################
+#                DataLoader                 #
+#############################################
 
 CIFAR_MEAN = torch.tensor((0.4914, 0.4822, 0.4465), dtype=torch.half)
 CIFAR_STD = torch.tensor((0.247, 0.2435, 0.2616), dtype=torch.half)
-
 
 @torch.compile()
 def batch_color_jitter(inputs, brightness_range: float, contrast_range: float):
@@ -249,12 +263,10 @@ def batch_color_jitter(inputs, brightness_range: float, contrast_range: float):
     inputs = inputs * contrast_scale
     return inputs
 
-
 @torch.compile()
 def batch_flip_lr(inputs):
     flip_mask = (torch.rand(len(inputs), device=inputs.device) < 0.5).view(-1, 1, 1, 1)
     return torch.where(flip_mask, inputs.flip(-1), inputs)
-
 
 @torch.compile()
 def batch_crop(images, crop_size):
@@ -283,7 +295,6 @@ def batch_crop(images, crop_size):
     cropped_images = images[batch_indices, channel_indices, y_indices, x_indices]
     return cropped_images
 
-
 class CifarLoader:
     def __init__(self, path, train=True, batch_size=500, aug=None):
         data_path = os.path.join(path, "train.pt" if train else "test.pt")
@@ -291,9 +302,7 @@ class CifarLoader:
             dset = torchvision.datasets.CIFAR10(path, download=True, train=train)
             images = torch.tensor(dset.data)
             labels = torch.tensor(dset.targets)
-            torch.save(
-                {"images": images, "labels": labels, "classes": dset.classes}, data_path
-            )
+            torch.save({"images": images, "labels": labels, "classes": dset.classes}, data_path)
         data = torch.load(data_path, map_location=torch.device("cuda"), weights_only=True)
         self.images, self.labels, self.classes = (
             data["images"],
@@ -312,7 +321,6 @@ class CifarLoader:
         self.batch_size = batch_size
         self.drop_last = train
         self.shuffle = train
-        
         # Pre-allocate pinned CPU memory for faster data transfer
         self._cpu_buffer = torch.zeros(
             self.images.shape,
@@ -330,29 +338,36 @@ class CifarLoader:
         )
 
     def __iter__(self):
+
         if self.epoch == 0:
             images = self.proc_images["norm"] = self.normalize(self.images)
+            # Pre-flip images in order to do every-other epoch flipping scheme
             if self.aug.get("flip", False):
                 images = self.proc_images["flip"] = batch_flip_lr(images)
+            # Pre-pad images to save time when doing random translation
             pad = self.aug.get("translate", 0)
             if pad > 0:
-                self.proc_images["pad"] = F.pad(images, (pad,) * 4, "reflect")
+                self.proc_images["pad"] = F.pad(images, (pad,)*4, "reflect")
+
         if self.aug.get("translate", 0) > 0:
             images = batch_crop(self.proc_images["pad"], self.images.shape[-2])
         elif self.aug.get("flip", False):
             images = self.proc_images["flip"]
         else:
             images = self.proc_images["norm"]
+        # Flip all images together every other epoch. This increases diversity relative to random flipping
         if self.aug.get("flip", False):
             if self.epoch % 2 == 1:
                 images = images.flip(-1)
+
         color_jitter_config = self.aug.get("color_jitter", {"enabled": False})
         if color_jitter_config.get("enabled", False):
             brightness = color_jitter_config.get("brightness_range", 0.1)
             contrast = color_jitter_config.get("contrast_range", 0.1)
             images = batch_color_jitter(images, brightness, contrast)
+
         self.epoch += 1
-        # Use pre-allocated indices for better performance
+
         if self.shuffle:
             torch.randperm(len(self._indices), out=self._indices)
             indices = self._indices
@@ -362,29 +377,29 @@ class CifarLoader:
             idxs = indices[i * self.batch_size : (i + 1) * self.batch_size]
             yield (images[idxs], self.labels[idxs])
 
+#############################################
+#            Network Definition             #
+#############################################
 
 class BatchNorm(nn.BatchNorm2d):
     def __init__(self, num_features, momentum=0.5566, eps=1e-12):
-        super().__init__(num_features, eps=eps, momentum=1 - momentum)
+        super().__init__(num_features, eps=eps, momentum=1-momentum)
         self.weight.requires_grad = False
-
+        # Note that PyTorch already initializes the weights to one and bias to zero
 
 class Conv(nn.Conv2d):
     def __init__(self, in_channels, out_channels):
-        super().__init__(
-            in_channels, out_channels, kernel_size=3, padding=1, bias=False
-        )
+        super().__init__(in_channels, out_channels, kernel_size=3, padding="same", bias=False)
 
     def reset_parameters(self):
         super().reset_parameters()
         w = self.weight.data
-        torch.nn.init.dirac_(w[: w.size(1)])
-
+        torch.nn.init.dirac_(w[:w.size(1)])
 
 class ConvGroup(nn.Module):
     def __init__(self, channels_in, channels_out):
         super().__init__()
-        self.conv1 = Conv(channels_in, channels_out)
+        self.conv1 = Conv(channels_in,  channels_out)
         self.pool = nn.MaxPool2d(2)
         self.norm1 = BatchNorm(channels_out)
         self.conv2 = Conv(channels_out, channels_out)
@@ -401,7 +416,6 @@ class ConvGroup(nn.Module):
         x = self.activ(x)
         return x
 
-
 class CifarNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -414,7 +428,7 @@ class CifarNet(nn.Module):
         self.whiten.weight.requires_grad = False
         self.layers = nn.Sequential(
             nn.GELU(),
-            ConvGroup(whiten_width, widths["block1"]),
+            ConvGroup(whiten_width,     widths["block1"]),
             ConvGroup(widths["block1"], widths["block2"]),
             ConvGroup(widths["block2"], widths["block3"]),
             nn.MaxPool2d(3),
@@ -423,14 +437,6 @@ class CifarNet(nn.Module):
         for mod in self.modules():
             mod.half()
         self.to(memory_format=torch.channels_last)
-
-    def forward(self, x, whiten_bias_grad=True):
-        x = x.to(memory_format=torch.channels_last)
-        b = self.whiten.bias
-        x = F.conv2d(x, self.whiten.weight, b if whiten_bias_grad else b.detach())
-        x = self.layers(x)
-        x = x.view(len(x), -1).contiguous()
-        return self.head(x) / x.size(-1)
 
     def reset(self):
         for m in self.modules():
@@ -459,6 +465,17 @@ class CifarNet(nn.Module):
             (eigenvectors_scaled, -eigenvectors_scaled)
         )
 
+    def forward(self, x, whiten_bias_grad=True):
+        x = x.to(memory_format=torch.channels_last)
+        b = self.whiten.bias
+        x = F.conv2d(x, self.whiten.weight, b if whiten_bias_grad else b.detach())
+        x = self.layers(x)
+        x = x.view(len(x), -1).contiguous()
+        return self.head(x) / x.size(-1)
+
+############################################
+#                 Logging                  #
+############################################
 
 def print_columns(columns_list, is_head=False, is_final_entry=False):
     print_string = ""
@@ -466,22 +483,12 @@ def print_columns(columns_list, is_head=False, is_final_entry=False):
         print_string += "|  %s  " % col
     print_string += "|"
     if is_head:
-        print("-" * len(print_string))
+        print("-"*len(print_string))
     print(print_string)
     if is_head or is_final_entry:
-        print("-" * len(print_string))
+        print("-"*len(print_string))
 
-
-logging_columns_list = [
-    "run   ",
-    "epoch",
-    "train_acc",
-    "val_acc",
-    "tta_val_acc",
-    "time_seconds",
-]
-
-
+logging_columns_list = ["run   ", "epoch", "train_acc", "val_acc", "tta_val_acc", "time_seconds"]
 def print_training_details(variables, is_final_entry):
     formatted = []
     for col in logging_columns_list:
@@ -496,6 +503,9 @@ def print_training_details(variables, is_final_entry):
         formatted.append(res.rjust(len(col)))
     print_columns(formatted, is_final_entry=is_final_entry)
 
+############################################
+#               Evaluation                 #
+############################################
 
 def infer(model, loader, tta_level=0):
     def infer_basic(inputs, net):
@@ -573,11 +583,13 @@ def infer(model, loader, tta_level=0):
     else:  # tta_level == 2
         return tta(model, test_images)
 
-
 def evaluate(model, loader, tta_level=0):
     logits = infer(model, loader, tta_level)
     return (logits.argmax(1) == loader.labels).float().mean().item()
 
+############################################
+#                Training                  #
+############################################
 
 def main(run, model):
     training_batch_size = 1536
@@ -598,7 +610,7 @@ def main(run, model):
                 "contrast_range": 0.1308,
             },
         },
-        )
+    )
     if run == "warmup":
         train_loader.labels = torch.randint(
             0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device
@@ -643,24 +655,18 @@ def main(run, model):
     for opt in optimizers:
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
+    # For accurately timing GPU code
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
     time_seconds = 0.0
-
     def start_timer():
         starter.record()
-
     def stop_timer():
         ender.record()
         torch.cuda.synchronize()
         nonlocal time_seconds
-        time_seconds += 0.001 * starter.elapsed_time(ender)
+        time_seconds += 1e-3 * starter.elapsed_time(ender)
 
-    # Warm up CUDA context
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-
-    model.reset()
     step = 0
     start_timer()
     with torch.no_grad():
@@ -683,6 +689,9 @@ def main(run, model):
         return loss
 
     for epoch in range(ceil(total_train_steps / len(train_loader))):
+        ####################
+        #     Training     #
+        ####################
         model.train()
         for inputs, labels in train_loader:
             # Determine if we should train whiten bias
@@ -712,6 +721,10 @@ def main(run, model):
         if step >= total_train_steps:
             break
 
+    ####################
+    #  TTA Evaluation  #
+    ####################
+
     tta_val_acc = evaluate(model, test_loader, tta_level=2)
     stop_timer()
     epoch = "eval"
@@ -719,7 +732,6 @@ def main(run, model):
     val_acc = evaluate(model, test_loader, tta_level=0)
     print_training_details(locals(), is_final_entry=True)
     return (val_acc, tta_val_acc, time_seconds)
-
 
 if __name__ == "__main__":
     model = CifarNet().cuda().to(memory_format=torch.channels_last)
@@ -738,6 +750,7 @@ if __name__ == "__main__":
         print(
             f"Mean accuracy after {run + 1} runs: {sum(accs_so_far) / len(accs_so_far):.6f} | Mean time: {sum(times_so_far) / len(times_so_far):.6f}s", end='\r', flush=True
         )
+    print()
     _, accs, times = zip(*results)
     accs = torch.tensor(accs)
     times = torch.tensor(times)
