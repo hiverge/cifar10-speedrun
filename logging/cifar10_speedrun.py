@@ -322,11 +322,11 @@ class CifarLoader:
         self.drop_last = train
         self.shuffle = train
         # Pre-allocate pinned CPU memory for faster data transfer
-        self._cpu_buffer = torch.zeros(
-            self.images.shape,
-            dtype=torch.half,
-            device='cpu'
-        ).pin_memory().contiguous()
+   #     self._cpu_buffer = torch.zeros(
+   #         self.images.shape,
+   #         dtype=torch.half,
+   #         device='cpu'
+   #     ).pin_memory().contiguous()
         # Pre-allocate indices tensor for better performance
         self._indices = torch.empty(len(self.images), dtype=torch.long, device="cuda")
 
